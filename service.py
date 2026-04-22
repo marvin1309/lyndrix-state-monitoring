@@ -39,6 +39,9 @@ class MonitoringService:
         self.http_client = httpx.AsyncClient(follow_redirects=True)
         self._scheduler_started = False
         self._probe_semaphore = asyncio.Semaphore(24)
+        self._initial_probe_delay_seconds = 8
+        self._initial_probe_worker_limit = 3
+        self._initial_probe_batch_limit = 48
         self._inflight_probes: set = set()
         self._background_probe_task: Optional[asyncio.Task] = None
         self._bootstrap_task: Optional[asyncio.Task] = None
@@ -164,7 +167,7 @@ class MonitoringService:
         return 3
 
     async def _run_probe_refresh_batch(self):
-        await asyncio.sleep(2)
+        await asyncio.sleep(self._initial_probe_delay_seconds)
         session = self._session()
         if not session:
             return
@@ -176,8 +179,15 @@ class MonitoringService:
                 and r.latest_state in {MonitorState.UNKNOWN.value, MonitorState.DOWN.value}
             ]
             candidates.sort(key=lambda r: (self._probe_priority(r), r.updated_at or _utc_now()))
+            if self._initial_probe_batch_limit > 0:
+                candidates = candidates[: self._initial_probe_batch_limit]
             pending_ids = [r.monitor_id for r in candidates]
-            worker_count = max(1, min(8, len(pending_ids)))
+            worker_count = max(1, min(self._initial_probe_worker_limit, len(pending_ids)))
+
+            if pending_ids:
+                self.ctx.log.info(
+                    f"State Monitoring: starting initial probe refresh for {len(pending_ids)} monitors with {worker_count} workers."
+                )
 
             async def worker():
                 while pending_ids:
